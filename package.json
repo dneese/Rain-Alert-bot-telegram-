@@ -1,0 +1,12 @@
+{
+  "name": "weather-bots",
+  "version": "1.0.0",
+  "description": "Cloudflare Workers migration for rain-alert-bot and pogoda-bot",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

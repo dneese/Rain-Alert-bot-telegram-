@@ -1,0 +1,11 @@
+name = "weather-bots"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+  TELEGRAM_BOT_TOKEN = ""       # rain-bot token (set via: wrangler secret put TELEGRAM_BOT_TOKEN)
+  BOT_TOKEN = ""                # pogoda bot token 8883331647:... (set via: wrangler secret put BOT_TOKEN)
+  SUPABASE_ANON_KEY = "sb_publishable_duxI3Q3PHuo3WBe_xNCRqA_Krzfrfni"  # Supabase anon key for rain project ljavyrmgcepwximavjyz
+  WEBHOOK_BASE = ""             # public base URL for webhook setups (e.g. https://weather-bots.xyz)
+  CHECK_CRON = "*/15 * * * *"   # every 15 minutes
+  RADAR_CACHE_TTL_MS = "3600000" # 1 hour radar cache
+  SUPABASE_SERVICE_ROLE = "sb_publishable_w8mle2GHp_xOTw9hdrX_6A_-2uycK5E"  # ← CRITICAL: for pogoda DB project zabqvbtfsdasbnyfvchu (different account, service_role key)
