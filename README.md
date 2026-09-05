@@ -1,7 +1,14 @@
-# weather-bots — Telegram Rain Alert Bot on Cloudflare Workers
+# weather-bots — Telegram Weather Alert Bots on Cloudflare Workers
 
-Telegram-бот `@AlertRain_bot` (opовещение о дожде) развёрнутый на Cloudflare
-Workers (бесплатный тариф). Воркер `rain-alert-bot`:
+**Сейчас работает бот [@PogodaAlert_bot](https://t.me/PogodaAlert_bot)**
+(оповещения об опасных погодных явлениях: дождь, снег, ветер, жара, грозы).
+
+В этом репозитории также хранится подготовка второго бота — `@AlertRain_bot`
+(оповещение о дожде), воркер `rain-alert-bot` на Cloudflare Workers:
+
+- обрабатывает `fetch` (Telegram webhook) и `scheduled` (крон `*/15 * * * *`),
+- хранит пользователей/настройки/локации/API-ключи в Supabase (REST, anon key),
+- использует Open-Meteo и опциональные API-ключи (WeatherAPI, OpenWeatherMap, Rainbow).
 
 - обрабатывает `fetch` (Telegram webhook) и `scheduled` (крон `*/15 * * * *`),
 - хранит пользователей/настройки/локации/API-ключи в Supabase (REST, anon key),
