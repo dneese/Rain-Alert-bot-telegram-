@@ -1,15 +1,23 @@
-const SUPABASE_URL = 'https://ljavyrmgcepwximavjyz.supabase.co';
-const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY;
+let SUPABASE_URL = 'https://ljavyrmgcepwximavjyz.supabase.co';
+let SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || '';
 
-const headers = {
-  'apikey': SUPABASE_KEY,
-  'Authorization': `Bearer ${SUPABASE_KEY}`,
-  'Content-Type': 'application/json',
-  'Prefer': 'return=representation',
-};
+export function configureDb(env) {
+  env = env || {};
+  if (env.SUPABASE_URL) SUPABASE_URL = env.SUPABASE_URL;
+  if (env.SUPABASE_ANON_KEY) SUPABASE_KEY = env.SUPABASE_ANON_KEY;
+}
+
+function headers() {
+  return {
+    'apikey': SUPABASE_KEY,
+    'Authorization': `Bearer ${SUPABASE_KEY}`,
+    'Content-Type': 'application/json',
+    'Prefer': 'return=representation',
+  };
+}
 
 async function supaGet(table, params = '') {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${params}`, { headers });
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${params}`, { headers: headers() });
   if (!res.ok) throw new Error(`Supabase GET: ${res.status} ${await res.text()}`);
   return res.json();
 }
@@ -17,7 +25,7 @@ async function supaGet(table, params = '') {
 async function supaPost(table, data) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
     method: 'POST',
-    headers,
+    headers: headers(),
     body: JSON.stringify(data),
   });
   if (!res.ok) throw new Error(`Supabase POST: ${res.status} ${await res.text()}`);
@@ -27,7 +35,7 @@ async function supaPost(table, data) {
 async function supaPatch(table, filter, data) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${filter}`, {
     method: 'PATCH',
-    headers,
+    headers: headers(),
     body: JSON.stringify(data),
   });
   if (!res.ok) throw new Error(`Supabase PATCH: ${res.status} ${await res.text()}`);
@@ -78,7 +86,7 @@ export async function saveUserApiKey(chatId, provider, apiKey) {
 export async function deleteUserApiKey(chatId, provider) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/user_api_keys?chat_id=eq.${chatId}&provider=eq.${provider}`, {
     method: 'DELETE',
-    headers,
+    headers: headers(),
   });
   if (!res.ok) throw new Error(`Supabase DELETE: ${res.status}`);
   return true;
@@ -132,7 +140,7 @@ export async function setDefaultLocation(chatId, locationId) {
 export async function deleteUserLocation(chatId, locationId) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/user_locations?id=eq.${locationId}&chat_id=eq.${chatId}`, {
     method: 'DELETE',
-    headers,
+    headers: headers(),
   });
   if (!res.ok) throw new Error(`Supabase DELETE: ${res.status}`);
   return true;
@@ -147,7 +155,7 @@ export async function updateUserLocationState(chatId, locId, data) {
 export async function supaDelete(table, filter) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${filter}`, {
     method: 'DELETE',
-    headers,
+    headers: headers(),
   });
   if (!res.ok) throw new Error(`Supabase DELETE: ${res.status}`);
   return true;

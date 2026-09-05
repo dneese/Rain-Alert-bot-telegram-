@@ -1,0 +1,16 @@
+name = "rain-alert-bot"
+main = "src/rain-only.js"
+compatibility_flags = ["nodejs_compat"]
+
+[triggers]
+crons = ["*/15 * * * *"]
+
+[vars]
+  SUPABASE_URL = "https://ljavyrmgcepwximavjyz.supabase.co"
+  SUPABASE_ANON_KEY = "sb_publishable_w8mle2GHp_xOTw9hdrX_6A_-2uycK5E"
+  WEATHERAPI_KEY = ""
+  OWM_KEY = ""
+  RAINBOW_KEY = ""
+
+# Secrets (set via: wrangler secret put TELEGRAM_BOT_TOKEN)
+# TELEGRAM_BOT_TOKEN — rain bot token

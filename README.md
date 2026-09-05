@@ -1,80 +1,114 @@
-# Weather Bots — Cloudflare Workers Migration
+# weather-bots — Telegram Rain Alert Bot on Cloudflare Workers
 
-## Overview
-Migration of Telegram weather bots (rain-alert-bot + pogoda-bot) from PandaStack to Cloudflare Workers Free tier.
+Telegram-бот `@AlertRain_bot` (opовещение о дожде) развёрнутый на Cloudflare
+Workers (бесплатный тариф). Воркер `rain-alert-bot`:
 
-## Architecture
-- **Single Worker** with one cron trigger `*/15 * * * *` (every 15 minutes)
-- **Rain bot**: adapted from `rain-bot.js` — uses Supabase REST (anon key) for user DB
-- **Pogoda bot**: uses custom REST adapter (`pogoda/db.js`) without `pg` — Supabase project `zabqvbtfsdasbnyfvchu`
-- **One cron**, one deploy — well within Free tier limits (100K req/day, 10ms CPU, 5 cron triggers)
+- обрабатывает `fetch` (Telegram webhook) и `scheduled` (крон `*/15 * * * *`),
+- хранит пользователей/настройки/локации/API-ключи в Supabase (REST, anon key),
+- использует Open-Meteo и опциональные API-ключи (WeatherAPI, OpenWeatherMap, Rainbow).
 
-## Project Structure
+## Структура
+
 ```
 weather-workers/
-├── wrangler.toml      # Config with [vars] — set via `wrangler secret put`
-├── worker-src.js      # Main worker code (fetch + scheduled)
-├── src/index.js       # ESM entry point
-├── package.json
-├── README.md
-├── rain/
-│   ├── rain-bot.js    # Adapted ESM (node:zlib, configure(env), exported handlers)
+├── src/rain-only.js        # Entry point воркера (export default: fetch + scheduled)
+├── rain/                   # Код rain-бота
+│   ├── rain-bot.js         # handleRequest / runScheduled / handleWebhook
 │   └── lib/
-│       ├── db.js      # Supabase anon key reads
-│       └── i18n.js    # 198KB ESM translations (verbatim)
-└── pogoda/
-    ├── weather.js     # Verbatim (getForecast, analyzeForecast etc.)
-    ├── alerts.js      # Verbatim (checkAndNotify, buildCardContent, KIND_META)
-    ├── radar.js       # Verbatim (getRadarAnalysis)
-    ├── stats.js       # Verbatim (in-memory counters)
-    ├── logger.js      # Verbatim (simple logging)
-    ├── db.js          # REST adapter (14 functions: upsertSubscriber, etc.)
-    └── bot-client.cjs # Telegram client (sendMessage, sendRichMessage, editMessageText, answerCallbackQuery)
+│       ├── db.js           # Supabase REST адаптер (configureDb(env), headers())
+│       └── i18n.js         # Переводы (uk/en/ru/pl/de/fr)
+├── scripts/
+│   └── deploy-rain-worker.sh  # Деплой через Cloudflare REST API (без wrangler)
+├── wrangler.rain.toml      # Конфиг для wrangler (альтернативный способ)
+├── pogoda/                 # Второй бот (погода) — не деплоится, справочно
+├── worker-src.js           # Старый монолит (rain+pogoda) — справочно
+└── wrangler.toml           # Старый конфиг обоих ботов
 ```
 
-## Quick Deploy (Dashboard — recommended)
+## Деплой через REST API (работает из Termux/Linux, без wrangler)
 
-1. Go to https://dash.cloudflare.com → login (kikikiska@gmail.com)
-2. **Workers → Create Service** → name: `weather-bots`
-3. **Quick edit** → paste all code from `worker-src.js`
-4. **Settings → Variables** — add these variables:
-   - `TELEGRAM_BOT_TOKEN` — rain bot token
-   - `BOT_TOKEN` — `8883331647:AAFerI2sfcDnhYnnYXq6rxQAEZ5QdEOdh8s` (pogoda)
-   - `SUPABASE_ANON_KEY` — `sb_publishable_duxI3Q3PHuo3WBe_xNCRqA_Krzfrfni`
-   - `SUPABASE_SERVICE_ROLE` — `sb_publishable_w8mle2GHp_xOTw9hdrX_6A_-2uycK5E`
-   - `WEBHOOK_BASE` — `https://weather-bots.xyz` (your domain)
-   - `CHECK_CRON` — `*/15 * * * *`
-   - `RADAR_CACHE_TTL_MS` — `3600000`
-5. **Deploy**
-6. After deploy, copy the worker URL (e.g. `weather-bots.xxx.workers.dev`)
-7. Set Telegram webhooks:
-   - Rain: `https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<worker-url>/rain/webhook`
-   - Pogoda: `https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<worker-url>/pogoda/webhook`
+wrangler не работает на Android/Termux (`workerd: Unsupported platform`), поэтому
+используется официальный Cloudflare REST API — curl + multipart upload.
 
-## Manual Deploy (wrangler CLI — if you have npm on PC)
+Необходимо:
+
+- Cloudflare аккаунт, API-токен с правами «Workers Edit» (`CF_API_TOKEN`),
+- account id (`CF_ACCOUNT_ID`),
+- Telegram bot token (создать через `@BotFather`) и
+- Supabase проект со схемой бота: таблицы `users`, `user_settings`,
+  `user_api_keys`, `user_locations` (+ publishable/anon key и REST URL).
+
+### 1. Сборка бандла (esbuild)
 
 ```bash
-npm install -g wrangler
-wrangler login          # browser login
-wrangler secret put TELEGRAM_BOT_TOKEN
-wrangler secret put BOT_TOKEN              # 8883331647:...
-wrangler secret put SUPABASE_ANON_KEY      # sb_publishable_duxI3Q3PHuo3WBe_xNCRqA_Krzfrfni
-wrangler secret put SUPABASE_SERVICE_ROLE  # sb_publishable_w8mle2GHp_xOTw9hdrX_6A_-2uycK5E
-wrangler secret put WEBHOOK_BASE           # https://...
-wrangler deploy
+npm install          # esbuild (workerd/wrangler не нужны)
+node node_modules/esbuild/bin/esbuild src/rain-only.js \
+  --bundle --format=esm --platform=browser --target=es2022 \
+  --outfile=dist/rain-bot-worker.js --external:node:zlib
 ```
 
-## Cost
-- **$0 / month** — Cloudflare Workers Free tier:
-  - 100K requests / day
-  - 10ms CPU / invocation
-  - 5 cron triggers (we use 1)
-  - No hibernation needed — always on within limits
+Итоговый файл — `dist/rain-bot-worker.js` (в `.gitignore`).
 
-## Files Modified from Original
-- `rain/rain-bot.js` — removed `http.createServer`, added `node:zlib`, env shim via `configure(env)`, exported `handleRequest` / `runScheduled`
-- `pogoda/db.js` — new: REST adapter without `pg` (uses `SUPABASE_ANON_KEY` + `SUPABASE_SERVICE_ROLE`)
-- `pogoda/bot-client.cjs` — new: Telegram client (MarkdownV2 fallback)
-- `src/index.js` — new: ESM entry with routing + scheduled
-- `wrangler.toml` — updated with vos variables + `nodejs_compat`
-- `worker-src.js` — snapshot of worker code for Dashboard upload
+### 2. Деплой
+
+```bash
+cd weather-workers
+CF_API_TOKEN="<token>"
+CF_ACCOUNT_ID="<account_id>"
+TELEGRAM_BOT_TOKEN="<bot token>"
+
+bash scripts/deploy-rain-worker.sh
+```
+
+Скрипт выполняет три шага через API:
+
+1. `PUT /accounts/{id}/workers/scripts/rain-alert-bot` — загрузка модуля
+   (`main_module` + биндинги: `TELEGRAM_BOT_TOKEN` (secret), `SUPABASE_URL`,
+   `SUPABASE_ANON_KEY`, пустые `WEATHERAPI_KEY`/`OWM_KEY`/`RAINBOW_KEY`).
+2. `PUT .../schedules` c телом `[{"cron":"*/15 * * * *"}]` — крон.
+3. `POST .../subdomain` с телом `{"enabled":true}` — включение `*.workers.dev`.
+
+> Важно: воркер должен экспортировать `export default { fetch, scheduled }`.
+> Именованные экспорты (`export { fetch }`) привязывают маршрут workers.dev
+> некорректно — сайт покажет «There is nothing here yet». Entry point уже в
+> нужной форме.
+
+Переменные воркера тоже можно задать вручную: `CF_WORKER_NAME`,
+`SUPABASE_URL`, `SUPABASE_ANON_KEY`.
+
+### 3. Настройка webhook Telegram
+
+```bash
+curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://rain-alert-bot.<subdomain>.workers.dev/webhook"
+```
+
+Публичный URL: `https://rain-alert-bot.<account-subdomain>.workers.dev`
+(account-subdomain берётся из `GET /accounts/{id}/workers/subdomain`).
+
+Проверка: `GET https://.../health` → `{"status":"ok",...}`,
+`getWebhookInfo` → `pending_update_count: 0`, без `last_error_message`.
+
+## Альтернативный способ: wrangler (на ПК с обычной ОС)
+
+```bash
+npm install -D wrangler
+wrangler login
+wrangler secret put TELEGRAM_BOT_TOKEN
+wrangler deploy -c wrangler.rain.toml
+```
+
+`wrangler.rain.toml` уже содержит `name`, `main`, crons, `nodejs_compat` и
+variables; `TELEGRAM_BOT_TOKEN` — только через `secret put`.
+
+## Ограничения бесплатного тарифа
+
+- 100 000 запросов/день,
+- 10ms CPU-время на вызов (достаточно),
+- 5 cron-триггеров (используется 1).
+
+## Как вернуть секреты безопасно
+
+`TELEGRAM_BOT_TOKEN` хранится в Cloudflare как `secret_text` биндинг — он
+зашивается платформой и не попадает в git. В репозиторий не коммитить API
+токены, ключи Supabase `sb_secret_*` и токены ботов. При публикации
+форка/копии задавайте собственные значения через env при запуске скрипта.
