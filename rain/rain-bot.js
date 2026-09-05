@@ -175,6 +175,9 @@ function settingsDetailKeyboard(lang, settings) {
         { text: `${radarLabel}`, callback_data: 'cb_settings_radar' },
       ],
       [
+        { text: `${s.exp_trajectory === true ? '🧪' : '🧪'} ${t(lang, 'exp_trajectory')}: ${s.exp_trajectory === true ? '✅' : '❌'}`, callback_data: 'cb_settings_exp' },
+      ],
+      [
         { text: `⏰ ${t(lang, 'set_cooldown')}: ${s.alert_cooldown_min || 30}${t(lang, 'unit_min')}`, callback_data: 'cb_settings_cooldown' },
       ],
       [
@@ -649,6 +652,66 @@ async function fetchWeatherAPI(lat, lon, apiKey) {
     }));
 }
 
+// Translate an OWM weather id to the nearest WMO weather code so the shared
+// card/severe-warning logic (WMO_CODES) works with OWM as the single source.
+function owmToWmo(id) {
+  if (id == null) return null;
+  if (id >= 200 && id < 300) return 95;          // thunderstorm
+  if (id >= 300 && id < 400) return 53;          // drizzle
+  if (id >= 500 && id < 600) {                   // rain
+    if (id === 500) return 61;
+    if (id === 501) return 63;
+    if (id === 511) return 67;
+    return 65;
+  }
+  if (id >= 600 && id < 700) {                   // snow
+    if (id === 600) return 71;
+    if (id === 601) return 73;
+    return 75;
+  }
+  if (id >= 700 && id < 800) return 45;          // atmosphere/mist/fog
+  if (id === 800) return 0;                      // clear
+  if (id === 801) return 1;
+  if (id === 802) return 2;
+  if (id === 803) return 3;
+  return 3;                                      // 804 overcast
+}
+
+// OWM current observation (/data/2.5/weather) — the authoritative "is it
+// raining right now" signal. The 3h forecast API can say dry while a band of
+// rain is already overhead, so we treat current precip as decisive.
+async function fetchOWMCurrent(lat, lon, apiKey) {
+  const key = apiKey || OWM_KEY;
+  if (!key) return null;
+  const url = `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&units=metric&appid=${key}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`OWM current: ${res.status}`);
+  const d = await res.json();
+  const rain1h = d.rain && typeof d.rain['1h'] === 'number' ? d.rain['1h'] : 0;
+  const snow1h = d.snow && typeof d.snow['1h'] === 'number' ? d.snow['1h'] : 0;
+  const id = d.weather?.[0]?.id ?? null;
+  const wmo = owmToWmo(id);
+  // 2xx thunder, 3xx drizzle, 5xx rain, 6xx snow — precipitation now
+  const codeRain = id != null && id < 700 && id % 100 !== 0 && Math.floor(id / 100) >= 2;
+  return {
+    ms: d.dt ? d.dt * 1000 : Date.now(),
+    tzOffsetMs: typeof d.timezone === 'number' ? d.timezone * 1000 : null,
+    rain_mm: rain1h,
+    snow_mm: snow1h,
+    precip_mm: rain1h + snow1h,
+    weather_id: id,
+    weather_code: wmo,
+    weather_icon: WMO_CODES[wmo]?.icon || '🌤',
+    weather_desc: d.weather?.[0]?.description || '',
+    desc: d.weather?.[0]?.description || '',
+    temp_c: d.main?.temp ?? null,
+    humidity: d.main?.humidity ?? null,
+    wind_kph: d.wind?.speed ? d.wind.speed * 3.6 : null,
+    wind_deg: d.wind?.deg ?? null,
+    is_raining: (rain1h + snow1h) > 0.2 || (codeRain && (rain1h + snow1h) > 0.05),
+  };
+}
+
 async function fetchOWM(lat, lon, apiKey) {
   const key = apiKey || OWM_KEY;
   if (!key) return null;
@@ -657,19 +720,162 @@ async function fetchOWM(lat, lon, apiKey) {
   if (!res.ok) throw new Error(`OWM: ${res.status}`);
   const data = await res.json();
   const now = Date.now();
-  return (data.list || [])
+  const tzOffsetMs = typeof data.city?.timezone === 'number' ? data.city.timezone * 1000 : null;
+  const list = (data.list || [])
     .filter(item => item.dt * 1000 >= now - 3600000)
-    .map(item => ({
-      time: new Date(item.dt * 1000).toISOString().replace('.000Z', ''),
-      ms: item.dt * 1000,
-      probability: Math.round((item.pop || 0) * 100),
-      precip_mm: item.rain?.['3h'] ? item.rain['3h'] / 3 : (item.snow?.['3h'] ? item.snow['3h'] / 3 : 0),
-      temp_c: item.main?.temp ?? null,
-      humidity: item.main?.humidity ?? null,
-      wind_kph: item.wind?.speed ? item.wind.speed * 3.6 : null,
-      description: item.weather?.[0]?.description || '',
-      weather_id: item.weather?.[0]?.id ?? null,
-    }));
+    .map(item => {
+      const wid = item.weather?.[0]?.id ?? null;
+      const wmo = owmToWmo(wid);
+      return {
+        time: new Date(item.dt * 1000).toISOString().replace('.000Z', ''),
+        ms: item.dt * 1000,
+        probability: Math.round((item.pop || 0) * 100),
+        precip_mm: item.rain?.['3h'] ? item.rain['3h'] / 3 : (item.snow?.['3h'] ? item.snow['3h'] / 3 : 0),
+        temp_c: item.main?.temp ?? null,
+        humidity: item.main?.humidity ?? null,
+        wind_kph: item.wind?.speed ? item.wind.speed * 3.6 : null,
+        description: item.weather?.[0]?.description || '',
+        weather_id: wid,
+        wmo_code: wmo,
+      };
+    });
+  return { list, tzOffsetMs };
+}
+
+// === Experimental "factual rain trajectory" ===
+// Rather than trusting a forecast, we sample the *actual current* OWM weather at
+// a ring of points around the user's location. If it is really raining at some of
+// those points (a fact, not a prediction) and the wind is blowing from that cell
+// toward the user, we approximate when the rain will arrive (ETA). This is the
+// "погода то погода, а фактичний дощ то фактичний дощ" idea implemented via OWM
+// current observations instead of a radar (RainViewer returns NODATA globally).
+
+const EXP_KM = 10;                 // look within this radius (km)
+const EXP_RING_KM = 8;             // outer sampling ring radius (km)
+const EXP_RING_POINTS = 8;         // points on each ring
+const EXP_POINT_KM = 4;            // inner sampling ring radius (km)
+
+function destinationPoint(lat, lon, bearingDeg, distKm) {
+  const R = 6371;
+  const brg = (bearingDeg * Math.PI) / 180;
+  const lat1 = (lat * Math.PI) / 180;
+  const lon1 = (lon * Math.PI) / 180;
+  const angDist = distKm / R;
+  const lat2 = Math.asin(
+    Math.sin(lat1) * Math.cos(angDist) +
+    Math.cos(lat1) * Math.sin(angDist) * Math.cos(brg)
+  );
+  const lon2 = lon1 + Math.atan2(
+    Math.sin(brg) * Math.sin(angDist) * Math.cos(lat1),
+    Math.cos(angDist) - Math.sin(lat1) * Math.sin(lat2)
+  );
+  return { lat: (lat2 * 180) / Math.PI, lon: (lon2 * 180) / Math.PI };
+}
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Bearing FROM point A TO point B (the direction from A to B, degrees 0..360).
+function bearingDeg(lat1, lon1, lat2, lon2) {
+  const toRad = Math.PI / 180;
+  const y = Math.sin((lon2 - lon1) * toRad) * Math.cos(lat2 * toRad);
+  const x = Math.cos(lat1 * toRad) * Math.sin(lat2 * toRad) -
+    Math.sin(lat1 * toRad) * Math.cos(lat2 * toRad) * Math.cos((lon2 - lon1) * toRad);
+  return (((Math.atan2(y, x) * 180) / Math.PI) + 360) % 360;
+}
+
+function windDirName(lang, deg) {
+  const names = ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw'];
+  const idx = Math.round((((deg % 360) + 360) % 360) / 45) % 8;
+  return t(lang, 'dir_' + names[idx]);
+}
+
+// Reuse the short-lived point cache to avoid hammering OWM during a single cron run.
+const expPointCache = new Map();
+const EXP_POINT_CACHE_MS = 8 * 60 * 1000;
+
+async function sampleRainPoint(lat, lon, key) {
+  const ck = `${lat.toFixed(3)},${lon.toFixed(3)}`;
+  const cached = expPointCache.get(ck);
+  if (cached && Date.now() - cached.t < EXP_POINT_CACHE_MS) return cached.v;
+  let v;
+  try {
+    const cur = await fetchOWMCurrent(lat, lon, key);
+    v = {
+      raining: cur ? cur.is_raining : false,
+      mm: cur ? cur.precip_mm : 0,
+      wind_deg: cur ? cur.wind_deg : null,
+      wind_kph: cur ? cur.wind_kph : null,
+      ms: cur ? cur.ms : Date.now(),
+    };
+  } catch (e) {
+    console.warn('[EXP] sample fail:', e.message);
+    v = { raining: false, mm: 0, wind_deg: null, wind_kph: null, ms: Date.now() };
+  }
+  expPointCache.set(ck, { t: Date.now(), v });
+  if (expPointCache.size > 400) expPointCache.delete(expPointCache.keys().next().value);
+  return v;
+}
+
+// Returns { rainingCells, windFromDeg, windKph } based on factual OWM samples.
+// rainingCells = [{ bearing (from user toward cell), km (distance), mm }].
+// If samples are inconclusive because there is no OWM key, returns null.
+async function detectRainTrajectory(lat, lon, chatId) {
+  const owmKey = chatId ? await getUserApiKey(chatId, 'owm') : null;
+  const key = owmKey || OWM_KEY;
+  if (!key) return null;
+
+  const userCur = await sampleRainPoint(lat, lon, key);
+  const windFromDeg = userCur.wind_deg; // meteorological: direction wind blows FROM
+  const windKph = userCur.wind_kph;
+
+  // Sample points on two rings around the user (excluding the user point itself).
+  const cells = [];
+  const radii = [EXP_POINT_KM, EXP_RING_KM];
+  for (const r of radii) {
+    for (let i = 0; i < EXP_RING_POINTS; i++) {
+      const bearing = (360 / EXP_RING_POINTS) * i;
+      const p = destinationPoint(lat, lon, bearing, r);
+      const s = await sampleRainPoint(p.lat, p.lon, key);
+      if (s.raining) {
+        cells.push({ bearing, km: r, mm: s.mm });
+      }
+    }
+  }
+
+  return { cells, windFromDeg, windKph };
+}
+
+// Compute { etaMin, fromDir, bearingKm } for the most relevant rain cell:
+// prefer cells the wind is blowing FROM toward the user, and the nearest one.
+// Returns null when there is nothing actionable (no factual rain headed this way).
+function computeExpETA(cells, windFromDeg, windKph) {
+  if (!cells.length || windFromDeg == null || !windKph) return null;
+
+  // A cell at bearing B (from user) is being carried directly toward the user
+  // when the wind comes FROM the same direction as the cell (B ≈ windFromDeg):
+  // it sits upwind and the wind pushes it along the line to the user.
+  let best = null;
+  let bestScore = -Infinity;
+  for (const c of cells) {
+    let ang = Math.abs(((windFromDeg - c.bearing) + 540) % 360 - 180);
+    if (ang > 60) continue; // only cells upwind of the user within a cone
+    const speedKmh = windKph;
+    const etaMin = (c.km / Math.max(speedKmh, 1)) * 60;
+    const score = -c.km - ang / 8;
+    if (score > bestScore) {
+      bestScore = score;
+      best = { etaMin: Math.round(etaMin), fromDir: c.bearing, bearingKm: c.km, mm: c.mm };
+    }
+  }
+  return best;
 }
 
 async function fetchRainbowWeather(lat, lon, apiKey) {
@@ -708,8 +914,7 @@ async function fetchRainbowWeather(lat, lon, apiKey) {
   };
 }
 
-// Short-lived in-process cache of completed rain forecasts, keyed by "lat,lon".
-// Avoids repeating expensive external API calls (Open-Meteo/MET/OWM/Netatmo) when
+// Short-lived in-process cache of completed rain forecasts, keyed by "lat,lon".// Avoids repeating expensive external API calls (Open-Meteo/MET/OWM/Netatmo) when
 // multiple locations/checks for the same coords run back-to-back (e.g. self-ping,
 // sequential user /check). The DB already stores per-location alert *state*; this
 // only dedupes the transient forecast fetch to cut CPU-seconds (billing) and latency.
@@ -737,173 +942,82 @@ async function getRainForecast(lat, lon, chatId) {
     hasOwmKey: false,      // user provided an OpenWeatherMap key => OWM is authoritative
   };
 
-  // === PHASE 1: Collect data from ALL sources ===
+  // === PHASE 1: OWM is the ONLY source ===
+  // Open-Meteo / MET / WeatherAPI / Rainbow / RainViewer are intentionally
+  // NOT used: the user-provided OWM key is the single authoritative weather
+  // source (current observation + 3-hourly forecast).
+  const owmKey = chatId ? await getUserApiKey(chatId, 'owm') : null;
+  const key = owmKey || OWM_KEY;
 
-  // 1a. Open-Meteo: current + minutely_15 + hourly (PRIMARY - free, reliable)
-  let openMeteoData = null;
-  try {
-    openMeteoData = await fetchOpenMeteoFull(lat, lon);
-    result.current = openMeteoData.current;
-    result.minutely = openMeteoData.minutely;
-    result.forecast = openMeteoData.hourly;
-    result.daily = openMeteoData.daily;
-    result.source = 'Open-Meteo';
-    result.nowLocalMs = openMeteoData.nowLocalMs;
-    result.tzOffsetMs = openMeteoData.tzOffsetMs;
-    result.sourcesChecked.push('Open-Meteo');
-    if (openMeteoData.current.is_raining) {
-      result.rainSignals.push('Open-Meteo-current');
-    }
-    console.log(`[RainCascade] Open-Meteo: current.is_raining=${openMeteoData.current.is_raining}, precip=${openMeteoData.current.precipitation_mm}mm, rain=${openMeteoData.current.rain_mm}mm, code=${openMeteoData.current.weather_code}`);
-  } catch (e) {
-    console.warn('Open-Meteo failed:', e.message);
-  }
-
-  // 1b. MET Norway: fallback when Open-Meteo is down
-  if (!result.current) {
+  if (key) {
+    result.hasOwmKey = !!owmKey;
+    result.source = 'OWM';
+    result.sourcesChecked.push('OWM');
     try {
-      const met = await fetchMetNorway(lat, lon);
-      result.current = met.current;
-      result.forecast = met.hourly;
-      result.source = 'MET Norway';
-      result.nowLocalMs = Date.now();
-      result.tzOffsetMs = (await getTzOffsetSec(lat, lon)) * 1000;
-      result.sourcesChecked.push('MET Norway');
-      if (met.current.is_raining) result.rainSignals.push('MET-current');
-      console.log(`[RainCascade] MET Norway: current.is_raining=${met.current.is_raining}, precip=${met.current.precipitation_mm}mm`);
+      const currentData = await fetchOWMCurrent(lat, lon, key);
+      if (currentData) {
+        result.current = {
+          temp_c: currentData.temp_c,
+          humidity: currentData.humidity,
+          precipitation_mm: currentData.precip_mm,
+          rain_mm: currentData.rain_mm,
+          weather_code: currentData.weather_code,
+          wind_speed: currentData.wind_kph,
+          wind_deg: currentData.wind_deg,
+          is_raining: currentData.is_raining,
+          weather_icon: currentData.weather_icon,
+          weather_desc: currentData.weather_desc,
+        };
+        result.nowLocalMs = currentData.ms;
+        if (currentData.tzOffsetMs != null) result.tzOffsetMs = currentData.tzOffsetMs;
+        if (currentData.is_raining) {
+          result.rainSignals.push('OWM-current');
+          result.rainSignals.push('OWM-authoritative');
+          console.log(`[RainCascade] OWM current: rain now ${currentData.precip_mm.toFixed(2)}mm/h (${currentData.desc})`);
+        }
+      }
+
+      const forecastData = await fetchOWM(lat, lon, key);
+      if (forecastData?.list?.length) {
+        if (forecastData.tzOffsetMs != null && result.tzOffsetMs == null) result.tzOffsetMs = forecastData.tzOffsetMs;
+        result.forecast = forecastData.list;
+        // OWM forecast is 3-hourly; treat rain within +180/-30 min as decisive,
+        // because a 3h grid can place the first wet slot just past +120min.
+        const nowMs = result.nowLocalMs || Date.now();
+        const hasRain = result.forecast.some(f => {
+          const diff = (f.ms - nowMs) / (1000 * 60);
+          const probRain = (f.probability || 0) >= 40;
+          return diff <= 180 && diff >= -30 && (f.precip_mm > 0.2 || probRain);
+        });
+        if (hasRain) {
+          result.rainSignals.push('OWM');
+          result.rainSignals.push('OWM-authoritative');
+          console.log(`[RainCascade] OWM: rain in +180/-30min window`);
+        } else {
+          console.log(`[RainCascade] OWM: no rain in forecast window`);
+        }
+      }
     } catch (e) {
-      console.warn('MET Norway failed:', e.message);
+      console.warn('OWM failed:', e.message);
     }
+  } else {
+    console.warn('[RainCascade] No OWM key configured — card will show error');
   }
 
   result.lat = lat;
   result.lon = lon;
 
-  // 1d. Ensure nowLocalMs is set even if Open-Meteo failed
+  // Ensure nowLocalMs / tzOffsetMs are always set
   if (!result.nowLocalMs) {
     result.nowLocalMs = Date.now();
-    result.tzOffsetMs = (await getTzOffsetSec(lat, lon)) * 1000;
+    if (!result.tzOffsetMs) result.tzOffsetMs = (await getTzOffsetSec(lat, lon)) * 1000;
   }
 
-  // 2. RainViewer: real-time radar (FREE, no key) — INDEPENDENT source
-  try {
-    result.radar = await fetchRainViewer(lat, lon);
-    if (result.radar.stale) console.warn('RainViewer radar data is stale');
-    result.sourcesChecked.push('RainViewer');
-    if (result.radar.is_raining && result.radar.intensity >= 3) {
-      result.rainSignals.push('RainViewer-strong');
-      console.log(`[RainCascade] RainViewer: strong rain, intensity=${result.radar.intensity}`);
-    } else {
-      console.log(`[RainCascade] RainViewer: weak/no rain, intensity=${result.radar.intensity}`);
-    }
-  } catch (e) {
-    console.warn('RainViewer failed:', e.message);
-  }
-
-  // 3. Minutely_15: upcoming rain is "soon", handled by header. Do NOT flip "raining now".
-  // Only counts as a vote if there is actual precipitation in the next 60 min.
-  const next60minMs = result.nowLocalMs + 60 * 60 * 1000;
-  const soonRain = result.minutely.some(m => m.ms > result.nowLocalMs && m.ms <= next60minMs && m.precip_mm > 0.1);
-  if (soonRain) {
-    result.rainSignals.push('Open-Meteo-minutely');
-    console.log(`[RainCascade] Open-Meteo minutely: rain within 60 min`);
-  }
-
-  // 4. WeatherAPI/OWM/Rainbow: supplementary — ALWAYS check, not just when dry
-  if (chatId) {
-    const providers = [
-      // WeatherAPI and Rainbow are disabled: user-provided OWM is the only
-      // supplementary source (its own key has a generous rate limit).
-      // { name: 'weatherapi', fn: fetchWeatherAPI },
-      { name: 'owm', fn: fetchOWM },
-      // { name: 'rainbow', fn: fetchRainbowWeather },
-    ];
-    for (const p of providers) {
-      try {
-        const key = await getUserApiKey(chatId, p.name);
-        if (!key) continue;
-
-        if (p.name === 'weatherapi') {
-          const wa = await p.fn(lat, lon, key);
-          if (wa) {
-            result.sourcesChecked.push('WeatherAPI');
-            const hasRain = wa.some(f => {
-              const fMs = new Date(f.time.replace(' ', 'T') + 'Z').getTime() - (result.tzOffsetMs || 0);
-              const diff = (fMs - result.nowLocalMs) / (1000 * 60);
-              return diff <= 60 && diff >= -30 && f.precip_mm > 0.3;
-            });
-            if (hasRain) {
-              result.rainSignals.push('WeatherAPI');
-              console.log(`[RainCascade] WeatherAPI: rain in +60/-30min window`);
-            } else {
-              console.log(`[RainCascade] WeatherAPI: no rain`);
-            }
-          }
-        } else if (p.name === 'owm') {
-          const owmData = await p.fn(lat, lon, key);
-          if (owmData) {
-            result.sourcesChecked.push('OWM');
-            result.hasOwmKey = true;
-            // User-provided OWM key => OWM is authoritative for precipitation.
-            // Look a bit further ahead than the 60-min window so a real rain
-            // band is not missed, and treat any measured/probable precip as rain.
-            const hasRain = owmData.some(f => {
-              const diff = (f.ms - result.nowLocalMs) / (1000 * 60);
-              const probRain = (f.probability || 0) >= 40;
-              return diff <= 120 && diff >= -30 && (f.precip_mm > 0.2 || probRain);
-            });
-            if (hasRain) {
-              result.rainSignals.push('OWM');
-              result.rainSignals.push('OWM-authoritative');
-              // Make sure the header reflects OWM's rain (authoritative source)
-              const alreadyShown = (result.forecast || []).some(f => f.ms > result.nowLocalMs && f.precip_mm > 0.2);
-              if (!alreadyShown) {
-                const owmSoon = owmData.find(f => f.ms > result.nowLocalMs);
-                if (owmSoon) result.forecast = [owmSoon, ...(result.forecast || [])];
-              }
-              console.log(`[RainCascade] OWM: rain in +120/-30min window (authoritative key provided)`);
-            } else {
-              console.log(`[RainCascade] OWM: no rain`);
-            }
-          }
-        } else if (p.name === 'rainbow') {
-          const rb = await p.fn(lat, lon, key);
-          if (rb) {
-            result.sourcesChecked.push('Rainbow');
-            if (rb.current?.is_raining) {
-              result.rainSignals.push('Rainbow-current');
-              console.log(`[RainCascade] Rainbow: rain detected (current)`);
-            } else {
-              const hasRainSoon = rb.hourly?.some(f => {
-                const diff = (f.ms - result.nowLocalMs) / (1000 * 60);
-                return diff <= 60 && diff >= -30 && f.precip_mm > 0.3;
-              });
-              if (hasRainSoon) {
-                result.rainSignals.push('Rainbow');
-                console.log(`[RainCascade] Rainbow: rain in forecast`);
-              } else {
-                console.log(`[RainCascade] Rainbow: no rain`);
-              }
-            }
-          }
-        }
-      } catch (e) {
-        console.warn(`${p.name} failed:`, e.message);
-      }
-    }
-  }
-
-  // === PHASE 2: Form a consensus opinion ===
-  // A single strong, real-time observation is enough by itself:
-  //   - Open-Meteo / MET current (WMO code or measured precip) = measured rain now
-  //   - Radar intensity >= 4 = heavy precipitation overhead right now
-  // Otherwise require at least 2 INDEPENDENT sources agreeing on rain,
-  // so one noisy forecast provider cannot trigger a false "it is raining now".
+  // === PHASE 2: OWM alone decides ===
+  // OWM current observation or OWM forecast rain => it is/will be raining.
+  // No multi-provider consensus needed: OWM is the only source by design.
   const strongCurrent =
-    result.rainSignals.includes('Open-Meteo-current') ||
-    result.rainSignals.includes('MET-current') ||
-    result.rainSignals.includes('RainViewer-strong') ||
-    // User-provided OWM key => OWM forecast is authoritative for precip
+    result.rainSignals.includes('OWM-current') ||
     result.rainSignals.includes('OWM-authoritative');
   const independentVotes = new Set(result.rainSignals).size;
 
@@ -1308,6 +1422,7 @@ async function handleCallbackQuery(callbackQuery) {
       `🌧 ${t(uLang, 'set_rain_threshold')}: <b>${settings?.rain_threshold_mm || 0.5}${t(uLang, 'unit_mm')}</b>\n` +
       `⏱ ${t(uLang, 'set_lookahead')}: <b>${settings?.lookahead_min || 30}${t(uLang, 'unit_min')}</b>\n` +
       `📡 ${t(uLang, 'set_radar')}: <b>${settings?.radar_enabled !== false ? t(uLang, 'on') : t(uLang, 'off')}</b>\n` +
+      `🧪 ${t(uLang, 'exp_trajectory')}: <b>${settings?.exp_trajectory === true ? t(uLang, 'on') : t(uLang, 'off')}</b>\n` +
       `⏰ ${t(uLang, 'set_cooldown')}: <b>${settings?.alert_cooldown_min || 30}${t(uLang, 'unit_min')}</b>\n` +
       `${postureEmoji} ${t(uLang, 'set_mode')}: <b>${settings?.posture === 'outside' ? t(uLang, 'mode_outside') : t(uLang, 'mode_inside')}</b>\n\n` +
       `🌐 ${t(uLang, 'language_label')}: ${getLangFlag(uLang)} ${getLangName(uLang)}\n` +
@@ -1368,6 +1483,19 @@ async function handleCallbackQuery(callbackQuery) {
     const updatedSettings = await getUserSettings(chatId);
     await tgAnswerCallback(callbackQuery.id, newEnabled ? t(lang, 'toast_radar_on') : t(lang, 'toast_radar_off'));
     const msg = `<b>⚙️ ${t(uLang, 'set_radar')}</b>\n\n${t(uLang, 'set_radar_desc')}.\n${t(uLang, 'current_label')}: <b>${newEnabled ? t(uLang, 'on') : t(uLang, 'off')}</b>\n\n${t(uLang, 'btn_back')}.`;
+    await editWithFallback(chatId, messageId, msg, { reply_markup: settingsDetailKeyboard(uLang, updatedSettings) });
+    return;
+  }
+
+  if (data === 'cb_settings_exp') {
+    const settings = await getUserSettings(chatId);
+    const newEnabled = settings?.exp_trajectory === false;
+    await saveUserSettings(chatId, { exp_trajectory: newEnabled });
+    const u = await getUser(chatId);
+    const uLang = u?.language || 'uk';
+    const updatedSettings = await getUserSettings(chatId);
+    await tgAnswerCallback(callbackQuery.id, newEnabled ? t(lang, 'toast_exp_on') : t(lang, 'toast_exp_off'));
+    const msg = `<b>🧪 ${t(uLang, 'exp_trajectory')}</b>\n\n${t(uLang, 'exp_trajectory_desc')}.\n\n${t(uLang, 'current_label')}: <b>${newEnabled ? t(uLang, 'on') : t(uLang, 'off')}</b>`;
     await editWithFallback(chatId, messageId, msg, { reply_markup: settingsDetailKeyboard(uLang, updatedSettings) });
     return;
   }
@@ -2116,6 +2244,39 @@ async function checkAllUsers() {
                 alertsSent++;
               }
             }
+          }
+        }
+
+        // === Experimental factual-rain trajectory alert (opt-in) ===
+        // Uses actual current OWM observations around the location (not a forecast):
+        // if it is really raining within ~10 km and wind is carrying it toward the
+        // user, warn with an ETA. Dedup by exp_trajectory_last_ms + cooldown.
+        // Fires only while rain is NOT here yet (advance notice).
+        if (settings?.exp_trajectory === true && !needsRainAlert) {
+          try {
+            const traj = await detectRainTrajectory(loc.latitude, loc.longitude, user.chat_id);
+            if (traj) {
+              const expETA = computeExpETA(traj.cells, traj.windFromDeg, traj.windKph);
+              if (expETA && expETA.etaMin >= 5) {
+                const lastExp = Number(loc.exp_trajectory_last_ms) || 0;
+                const quietDedup = Date.now() - lastExp;
+                if (quietDedup > Math.max(cooldownMs, 20 * 60 * 1000)) {
+                  const fromName = windDirName(lang, expETA.fromDir);
+                  const expMsg =
+                    `<b>${t(lang, 'exp_alert_title')}</b>\n\n${locLabel}\n` +
+                    `${t(lang, 'exp_alert_body', { km: expETA.bearingKm, eta: expETA.etaMin })}\n\n` +
+                    `${t(lang, 'exp_alert_direction', { dir: fromName, bearing: expETA.bearingKm })}\n\n` +
+                    `⏳ ~${expETA.etaMin} ${t(lang, 'unit_min')} ${t(lang, 'exp_alert_calc')}`;
+                  const expSend = await sendWithFallback(user.chat_id, expMsg, {});
+                  if (expSend.ok) {
+                    await updateUserLocationState(user.chat_id, locId, { exp_trajectory_last_ms: Date.now() });
+                    alertsSent++;
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            console.warn(`[EXP] trajectory failed for ${user.chat_id} loc ${locId}:`, e.message);
           }
         }
       } catch (err) {
