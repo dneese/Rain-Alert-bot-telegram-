@@ -1,6 +1,7 @@
 import zlib from 'node:zlib';
 import { initDB, configureDb, getUser, saveUser, getAllUsers, getUserApiKey, getAllUserApiKeys, saveUserApiKey, deleteUserApiKey, getUserSettings, saveUserSettings, getUserLocations, getDefaultLocation, addUserLocation, setDefaultLocation, deleteUserLocation, updateUserLocationState } from './lib/db.js';
 import { t, getLangName, getLangFlag, languagePages } from './lib/i18n.js';
+import { interceptRainCell, cloudMotionFromWind } from './lib/vector-intercept.js';
 
 // === Environment (injected by the Worker bootstrap via configure()) ===
 let ENV = {};
@@ -162,7 +163,6 @@ function confirmKeyKeyboard(lang, provider) {
 
 function settingsDetailKeyboard(lang, settings) {
   const s = settings || {};
-  const radarLabel = s.radar_enabled !== false ? '📡 Radar ✅' : '📡 Radar ❌';
   return {
     inline_keyboard: [
       [
@@ -172,10 +172,10 @@ function settingsDetailKeyboard(lang, settings) {
         { text: `⏱ ${t(lang, 'set_lookahead')}: ${s.lookahead_min || 30}${t(lang, 'unit_min')}`, callback_data: 'cb_settings_lookahead' },
       ],
       [
-        { text: `${radarLabel}`, callback_data: 'cb_settings_radar' },
+        { text: `🧪 ${t(lang, 'exp_trajectory')}: ${s.exp_trajectory === true ? '✅' : '❌'}`, callback_data: 'cb_settings_exp' },
       ],
       [
-        { text: `${s.exp_trajectory === true ? '🧪' : '🧪'} ${t(lang, 'exp_trajectory')}: ${s.exp_trajectory === true ? '✅' : '❌'}`, callback_data: 'cb_settings_exp' },
+        { text: `🎯 ${t(lang, 'exp_radius')}: ${s.exp_radius_km || 10} ${t(lang, 'unit_km')}`, callback_data: 'cb_settings_exp_radius' },
       ],
       [
         { text: `⏰ ${t(lang, 'set_cooldown')}: ${s.alert_cooldown_min || 30}${t(lang, 'unit_min')}`, callback_data: 'cb_settings_cooldown' },
@@ -341,9 +341,7 @@ function sectionsKeyboard(lang, settings) {
   return {
     inline_keyboard: [
       [{ text: `📸 Поточна: ${s.show_current !== false ? '✅' : '❌'}`, callback_data: 'cb_toggle_current' }],
-      [{ text: `⏱ Міні-15: ${s.show_minutely !== false ? '✅' : '❌'}`, callback_data: 'cb_toggle_minutely' }],
       [{ text: `📅 Годинний: ${s.show_hourly !== false ? '✅' : '❌'}`, callback_data: 'cb_toggle_hourly' }],
-      [{ text: `📡 Радар: ${s.show_radar !== false ? '✅' : '❌'}`, callback_data: 'cb_toggle_show_radar' }],
       [{ text: t(lang, 'btn_back'), callback_data: 'cb_adv_settings' }],
     ],
   };
@@ -745,15 +743,17 @@ async function fetchOWM(lat, lon, apiKey) {
 // === Experimental "factual rain trajectory" ===
 // Rather than trusting a forecast, we sample the *actual current* OWM weather at
 // a ring of points around the user's location. If it is really raining at some of
-// those points (a fact, not a prediction) and the wind is blowing from that cell
-// toward the user, we approximate when the rain will arrive (ETA). This is the
-// "погода то погода, а фактичний дощ то фактичний дощ" idea implemented via OWM
-// current observations instead of a radar (RainViewer returns NODATA globally).
+// those points (a fact, not a prediction) and the cloud-motion vector (preferring
+// the 850 hPa leading wind, falling back to surface wind) carries that cell toward
+// the user, we compute the interception sector (cloud width) and the ETA. This is
+// the "погода то погода, а фактичний дощ то фактичний дощ" idea implemented via
+// OWM current observations instead of a radar (RainViewer returns NODATA globally).
 
-const EXP_KM = 10;                 // look within this radius (km)
-const EXP_RING_KM = 8;             // outer sampling ring radius (km)
-const EXP_RING_POINTS = 8;         // points on each ring
-const EXP_POINT_KM = 4;            // inner sampling ring radius (km)
+const EXP_RING_POINTS = 8;          // points on each sampling ring
+const EXP_CLOUD_RADIUS_KM = 2;      // assumed rain-cloud width (km)
+const EXP_INTENSITY_MIN_MMH = 0.5;  // ignore cells below this precipitation rate (mm/h)
+const EXP_POINT_CACHE_MS = 12 * 60 * 1000;
+const EXP_UPPERWIND_CACHE_MS = 15 * 60 * 1000;
 
 function destinationPoint(lat, lon, bearingDeg, distKm) {
   const R = 6371;
@@ -772,34 +772,16 @@ function destinationPoint(lat, lon, bearingDeg, distKm) {
   return { lat: (lat2 * 180) / Math.PI, lon: (lon2 * 180) / Math.PI };
 }
 
-function haversineKm(lat1, lon1, lat2, lon2) {
-  const R = 6371;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-// Bearing FROM point A TO point B (the direction from A to B, degrees 0..360).
-function bearingDeg(lat1, lon1, lat2, lon2) {
-  const toRad = Math.PI / 180;
-  const y = Math.sin((lon2 - lon1) * toRad) * Math.cos(lat2 * toRad);
-  const x = Math.cos(lat1 * toRad) * Math.sin(lat2 * toRad) -
-    Math.sin(lat1 * toRad) * Math.cos(lat2 * toRad) * Math.cos((lon2 - lon1) * toRad);
-  return (((Math.atan2(y, x) * 180) / Math.PI) + 360) % 360;
-}
-
 function windDirName(lang, deg) {
   const names = ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw'];
   const idx = Math.round((((deg % 360) + 360) % 360) / 45) % 8;
   return t(lang, 'dir_' + names[idx]);
 }
 
-// Reuse the short-lived point cache to avoid hammering OWM during a single cron run.
+// Short-lived point cache to avoid hammering OWM during a single cron run.
+// Keyed by rounded coordinates, so users who live in the same city share the
+// sampled points (geo-bucketing) instead of each fetching 17 points.
 const expPointCache = new Map();
-const EXP_POINT_CACHE_MS = 8 * 60 * 1000;
 
 async function sampleRainPoint(lat, lon, key) {
   const ck = `${lat.toFixed(3)},${lon.toFixed(3)}`;
@@ -809,70 +791,115 @@ async function sampleRainPoint(lat, lon, key) {
   try {
     const cur = await fetchOWMCurrent(lat, lon, key);
     v = {
-      raining: cur ? cur.is_raining : false,
       mm: cur ? cur.precip_mm : 0,
+      snow_mm: cur ? cur.snow_mm : 0,
       wind_deg: cur ? cur.wind_deg : null,
       wind_kph: cur ? cur.wind_kph : null,
+      temp_c: cur ? cur.temp_c : null,
       ms: cur ? cur.ms : Date.now(),
     };
   } catch (e) {
     console.warn('[EXP] sample fail:', e.message);
-    v = { raining: false, mm: 0, wind_deg: null, wind_kph: null, ms: Date.now() };
+    v = { mm: 0, snow_mm: 0, wind_deg: null, wind_kph: null, temp_c: null, ms: Date.now() };
   }
   expPointCache.set(ck, { t: Date.now(), v });
   if (expPointCache.size > 400) expPointCache.delete(expPointCache.keys().next().value);
   return v;
 }
 
-// Returns { rainingCells, windFromDeg, windKph } based on factual OWM samples.
-// rainingCells = [{ bearing (from user toward cell), km (distance), mm }].
-// If samples are inconclusive because there is no OWM key, returns null.
-async function detectRainTrajectory(lat, lon, chatId) {
+// 850 hPa (~1.5 km, the "leading flow" that actually carries clouds) wind from
+// Open-Meteo: free, no key. Cached per ~2 km geo-bucket so nearby users share it.
+const upperWindCache = new Map();
+
+function expGridKey(lat, lon) {
+  return `${Math.round(lat * 50)},${Math.round(lon * 50)}`;
+}
+
+async function fetchUpperWind850(lat, lon) {
+  const gk = expGridKey(lat, lon);
+  const cached = upperWindCache.get(gk);
+  if (cached && Date.now() - cached.t < EXP_UPPERWIND_CACHE_MS) return cached.v;
+  let v = null;
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=windspeed_850hPa,winddirection_850hPa&wind_speed_unit=kmh`;
+    const res = await fetch(url);
+    if (res.ok) {
+      const d = await res.json();
+      const kph = d?.current?.windspeed_850hPa;
+      const fromDeg = d?.current?.winddirection_850hPa;
+      if (typeof kph === 'number' && typeof fromDeg === 'number') {
+        v = { kph, fromDeg: ((fromDeg % 360) + 360) % 360 };
+      }
+    } else {
+      console.warn(`[EXP] upper wind HTTP ${res.status}`);
+    }
+  } catch (e) {
+    console.warn('[EXP] upper wind fail:', e.message);
+  }
+  upperWindCache.set(gk, { t: Date.now(), v });
+  if (upperWindCache.size > 200) upperWindCache.delete(upperWindCache.keys().next().value);
+  return v;
+}
+
+// Cloud-motion vector: prefer the 850 hPa flow, fall back to the surface wind
+// observed at the user's point.
+async function getCloudMotion(lat, lon, userCur) {
+  const upper = await fetchUpperWind850(lat, lon);
+  if (upper && upper.kph > 0) return cloudMotionFromWind(upper.fromDeg, upper.kph);
+  if (userCur.wind_deg != null && userCur.wind_kph) {
+    return cloudMotionFromWind(userCur.wind_deg, userCur.wind_kph);
+  }
+  return null;
+}
+
+// Returns { cells, motion, userTempC } based on factual OWM samples.
+// cells = [{ lat, lon, mm, snowMm }] — only cells with precipitation above the
+// intensity threshold. If there is no OWM key, returns null.
+async function detectRainTrajectory(lat, lon, chatId, radiusKm) {
   const owmKey = chatId ? await getUserApiKey(chatId, 'owm') : null;
   const key = owmKey || OWM_KEY;
   if (!key) return null;
 
+  const radius = Math.max(5, Number(radiusKm) || 10);
   const userCur = await sampleRainPoint(lat, lon, key);
-  const windFromDeg = userCur.wind_deg; // meteorological: direction wind blows FROM
-  const windKph = userCur.wind_kph;
+  const motion = await getCloudMotion(lat, lon, userCur);
 
   // Sample points on two rings around the user (excluding the user point itself).
+  // Point count is constant regardless of the radius: 2 rings x 8 dirs + center.
   const cells = [];
-  const radii = [EXP_POINT_KM, EXP_RING_KM];
+  const radii = [radius * 0.4, radius * 0.85];
   for (const r of radii) {
     for (let i = 0; i < EXP_RING_POINTS; i++) {
       const bearing = (360 / EXP_RING_POINTS) * i;
       const p = destinationPoint(lat, lon, bearing, r);
       const s = await sampleRainPoint(p.lat, p.lon, key);
-      if (s.raining) {
-        cells.push({ bearing, km: r, mm: s.mm });
+      if (s.mm >= EXP_INTENSITY_MIN_MMH) {
+        cells.push({ lat: p.lat, lon: p.lon, mm: s.mm, snowMm: s.snow_mm });
       }
     }
   }
 
-  return { cells, windFromDeg, windKph };
+  return { cells, motion, userTempC: userCur.temp_c };
 }
 
-// Compute { etaMin, fromDir, bearingKm } for the most relevant rain cell:
-// prefer cells the wind is blowing FROM toward the user, and the nearest one.
-// Returns null when there is nothing actionable (no factual rain headed this way).
-function computeExpETA(cells, windFromDeg, windKph) {
-  if (!cells.length || windFromDeg == null || !windKph) return null;
-
-  // A cell at bearing B (from user) is being carried directly toward the user
-  // when the wind comes FROM the same direction as the cell (B ≈ windFromDeg):
-  // it sits upwind and the wind pushes it along the line to the user.
+// Run the pure interception math over every detected cell and return the cell
+// that will hit the user soonest (ties broken by nearest distance).
+function pickBestInterception(cells, user, motion) {
   let best = null;
-  let bestScore = -Infinity;
   for (const c of cells) {
-    let ang = Math.abs(((windFromDeg - c.bearing) + 540) % 360 - 180);
-    if (ang > 60) continue; // only cells upwind of the user within a cone
-    const speedKmh = windKph;
-    const etaMin = (c.km / Math.max(speedKmh, 1)) * 60;
-    const score = -c.km - ang / 8;
-    if (score > bestScore) {
-      bestScore = score;
-      best = { etaMin: Math.round(etaMin), fromDir: c.bearing, bearingKm: c.km, mm: c.mm };
+    const hit = interceptRainCell({
+      user,
+      cell: { lat: c.lat, lon: c.lon, intensityMmh: c.mm },
+      motion,
+      opts: { cloudRadiusKm: EXP_CLOUD_RADIUS_KM },
+    });
+    if (hit) {
+      hit.snowMm = c.snowMm > 0;
+      hit.mm = c.mm;
+      if (!best || hit.etaMinutes < best.etaMinutes ||
+        (hit.etaMinutes === best.etaMinutes && hit.distanceKm < best.distanceKm)) {
+        best = hit;
+      }
     }
   }
   return best;
@@ -1421,7 +1448,6 @@ async function handleCallbackQuery(callbackQuery) {
     const msg = `<b>${t(uLang, 'settings_title')}</b>\n\n` +
       `🌧 ${t(uLang, 'set_rain_threshold')}: <b>${settings?.rain_threshold_mm || 0.5}${t(uLang, 'unit_mm')}</b>\n` +
       `⏱ ${t(uLang, 'set_lookahead')}: <b>${settings?.lookahead_min || 30}${t(uLang, 'unit_min')}</b>\n` +
-      `📡 ${t(uLang, 'set_radar')}: <b>${settings?.radar_enabled !== false ? t(uLang, 'on') : t(uLang, 'off')}</b>\n` +
       `🧪 ${t(uLang, 'exp_trajectory')}: <b>${settings?.exp_trajectory === true ? t(uLang, 'on') : t(uLang, 'off')}</b>\n` +
       `⏰ ${t(uLang, 'set_cooldown')}: <b>${settings?.alert_cooldown_min || 30}${t(uLang, 'unit_min')}</b>\n` +
       `${postureEmoji} ${t(uLang, 'set_mode')}: <b>${settings?.posture === 'outside' ? t(uLang, 'mode_outside') : t(uLang, 'mode_inside')}</b>\n\n` +
@@ -1474,19 +1500,6 @@ async function handleCallbackQuery(callbackQuery) {
     return;
   }
 
-  if (data === 'cb_settings_radar') {
-    const settings = await getUserSettings(chatId);
-    const newEnabled = settings?.radar_enabled === false;
-    await saveUserSettings(chatId, { radar_enabled: newEnabled });
-    const u = await getUser(chatId);
-    const uLang = u?.language || 'uk';
-    const updatedSettings = await getUserSettings(chatId);
-    await tgAnswerCallback(callbackQuery.id, newEnabled ? t(lang, 'toast_radar_on') : t(lang, 'toast_radar_off'));
-    const msg = `<b>⚙️ ${t(uLang, 'set_radar')}</b>\n\n${t(uLang, 'set_radar_desc')}.\n${t(uLang, 'current_label')}: <b>${newEnabled ? t(uLang, 'on') : t(uLang, 'off')}</b>\n\n${t(uLang, 'btn_back')}.`;
-    await editWithFallback(chatId, messageId, msg, { reply_markup: settingsDetailKeyboard(uLang, updatedSettings) });
-    return;
-  }
-
   if (data === 'cb_settings_exp') {
     const settings = await getUserSettings(chatId);
     const newEnabled = settings?.exp_trajectory === false;
@@ -1496,6 +1509,27 @@ async function handleCallbackQuery(callbackQuery) {
     const updatedSettings = await getUserSettings(chatId);
     await tgAnswerCallback(callbackQuery.id, newEnabled ? t(lang, 'toast_exp_on') : t(lang, 'toast_exp_off'));
     const msg = `<b>🧪 ${t(uLang, 'exp_trajectory')}</b>\n\n${t(uLang, 'exp_trajectory_desc')}.\n\n${t(uLang, 'current_label')}: <b>${newEnabled ? t(uLang, 'on') : t(uLang, 'off')}</b>`;
+    await editWithFallback(chatId, messageId, msg, { reply_markup: settingsDetailKeyboard(uLang, updatedSettings) });
+    return;
+  }
+
+  if (data === 'cb_settings_exp_radius') {
+    const settings = await getUserSettings(chatId);
+    const cur = Number(settings?.exp_radius_km) || 10;
+    const options = [10, 20, 30];
+    const next = options[(options.indexOf(cur) + 1) % options.length] || 10;
+    try {
+      await saveUserSettings(chatId, { exp_radius_km: next });
+    } catch (e) {
+      console.warn(`[SETTINGS] could not persist exp_radius_km for ${chatId}:`, e.message);
+      await tgAnswerCallback(callbackQuery.id, t(lang, 'error_generic'));
+      return;
+    }
+    const u = await getUser(chatId);
+    const uLang = u?.language || 'uk';
+    const updatedSettings = await getUserSettings(chatId);
+    await tgAnswerCallback(callbackQuery.id, `${t(lang, 'exp_radius')}: ${next} ${t(lang, 'unit_km')}`);
+    const msg = `<b>🎯 ${t(uLang, 'exp_radius')}</b>\n\n${t(uLang, 'exp_radius_desc')}.\n${t(uLang, 'current_label')}: <b>${next} ${t(uLang, 'unit_km')}</b>`;
     await editWithFallback(chatId, messageId, msg, { reply_markup: settingsDetailKeyboard(uLang, updatedSettings) });
     return;
   }
@@ -1729,9 +1763,7 @@ async function handleCallbackQuery(callbackQuery) {
   };
 
   if (data === 'cb_toggle_current') { await toggleSection('show_current'); return; }
-  if (data === 'cb_toggle_minutely') { await toggleSection('show_minutely'); return; }
   if (data === 'cb_toggle_hourly') { await toggleSection('show_hourly'); return; }
-  if (data === 'cb_toggle_show_radar') { await toggleSection('show_radar'); return; }
 
   // === Multi-Location ===
 
@@ -2248,25 +2280,32 @@ async function checkAllUsers() {
         }
 
         // === Experimental factual-rain trajectory alert (opt-in) ===
-        // Uses actual current OWM observations around the location (not a forecast):
-        // if it is really raining within ~10 km and wind is carrying it toward the
-        // user, warn with an ETA. Dedup by exp_trajectory_last_ms + cooldown.
+        // Samples actual current OWM observations around the location (not a
+        // forecast): if it is really raining within the chosen radius and the
+        // cloud-motion vector (850 hPa, falling back to surface wind) carries
+        // the rain toward the user, warn with an ETA. Dedup by
+        // exp_trajectory_last_ms + a 45-minute cooldown.
         // Fires only while rain is NOT here yet (advance notice).
         if (settings?.exp_trajectory === true && !needsRainAlert) {
           try {
-            const traj = await detectRainTrajectory(loc.latitude, loc.longitude, user.chat_id);
-            if (traj) {
-              const expETA = computeExpETA(traj.cells, traj.windFromDeg, traj.windKph);
-              if (expETA && expETA.etaMin >= 5) {
+            const traj = await detectRainTrajectory(loc.latitude, loc.longitude, user.chat_id, settings?.exp_radius_km);
+            if (traj && traj.motion) {
+              const hit = pickBestInterception(
+                traj.cells,
+                { lat: loc.latitude, lon: loc.longitude },
+                traj.motion
+              );
+              if (hit && hit.etaMinutes >= 5) {
                 const lastExp = Number(loc.exp_trajectory_last_ms) || 0;
                 const quietDedup = Date.now() - lastExp;
-                if (quietDedup > Math.max(cooldownMs, 20 * 60 * 1000)) {
-                  const fromName = windDirName(lang, expETA.fromDir);
+                if (quietDedup > Math.max(cooldownMs, 45 * 60 * 1000)) {
+                  const isSnow = hit.snowMm || (traj.userTempC != null && traj.userTempC < 2 && hit.mm > 0);
+                  const fromName = windDirName(lang, hit.fromDeg);
                   const expMsg =
-                    `<b>${t(lang, 'exp_alert_title')}</b>\n\n${locLabel}\n` +
-                    `${t(lang, 'exp_alert_body', { km: expETA.bearingKm, eta: expETA.etaMin })}\n\n` +
-                    `${t(lang, 'exp_alert_direction', { dir: fromName, bearing: expETA.bearingKm })}\n\n` +
-                    `⏳ ~${expETA.etaMin} ${t(lang, 'unit_min')} ${t(lang, 'exp_alert_calc')}`;
+                    `<b>${t(lang, isSnow ? 'exp_alert_title_snow' : 'exp_alert_title')}</b>\n\n${locLabel}\n` +
+                    `${t(lang, 'exp_alert_body', { km: hit.distanceKm, eta: hit.etaMinutes })}\n\n` +
+                    `${t(lang, 'exp_alert_direction', { dir: fromName, bearing: hit.distanceKm })}\n\n` +
+                    `⏳ ~${hit.etaMinutes} ${t(lang, 'unit_min')} ${t(lang, 'exp_alert_calc')}`;
                   const expSend = await sendWithFallback(user.chat_id, expMsg, {});
                   if (expSend.ok) {
                     await updateUserLocationState(user.chat_id, locId, { exp_trajectory_last_ms: Date.now() });
