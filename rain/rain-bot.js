@@ -858,28 +858,49 @@ async function getCloudMotion(lat, lon, userCur) {
 async function detectRainTrajectory(lat, lon, chatId, radiusKm) {
   const owmKey = chatId ? await getUserApiKey(chatId, 'owm') : null;
   const key = owmKey || OWM_KEY;
-  if (!key) return null;
-
   const radius = Math.max(5, Number(radiusKm) || 10);
-  const userCur = await sampleRainPoint(lat, lon, key);
-  const motion = await getCloudMotion(lat, lon, userCur);
 
-  // Sample points on two rings around the user (excluding the user point itself).
-  // Point count is constant regardless of the radius: 2 rings x 8 dirs + center.
+  // User-point observation (temperature for snow detection, wind fallback).
+  let userCur = null;
+  if (key) userCur = await sampleRainPoint(lat, lon, key);
+
+  const motion = await getCloudMotion(lat, lon, userCur || { wind_deg: null, wind_kph: null, temp_c: null });
+
+  // Primary: OWM control points at 4 cardinal points at ~12km radius.
+  // Gives good coverage for convective cells while keeping subrequests low
+  // (4 OWM calls vs 17 previous). The control points are at radius*0.85 from user,
+  // giving ETA ~10-15min at 36km/h wind.
   const cells = [];
-  const radii = [radius * 0.4, radius * 0.85];
-  for (const r of radii) {
-    for (let i = 0; i < EXP_RING_POINTS; i++) {
-      const bearing = (360 / EXP_RING_POINTS) * i;
-      const p = destinationPoint(lat, lon, bearing, r);
-      const s = await sampleRainPoint(p.lat, p.lon, key);
-      if (s.mm >= EXP_INTENSITY_MIN_MMH) {
-        cells.push({ lat: p.lat, lon: p.lon, mm: s.mm, snowMm: s.snow_mm });
-      }
+  const controlBearings = [0, 90, 180, 270]; // N, E, S, W
+  for (const bearing of controlBearings) {
+    const p = destinationPoint(lat, lon, bearing, radius * 0.85);
+    const s = await sampleRainPoint(p.lat, p.lon, key);
+    if (s.mm >= EXP_INTENSITY_MIN_MMH) {
+      cells.push({ lat: p.lat, lon: p.lon, mm: s.mm, snowMm: s.snow_mm });
     }
   }
 
-  return { cells, motion, userTempC: userCur.temp_c };
+  // If no cells from control points, try the user point itself.
+  if (cells.length === 0) {
+    const userCell = await sampleRainPoint(lat, lon, key);
+    if (userCell.mm >= EXP_INTENSITY_MIN_MMH && userCell.mm > 0) {
+      cells.push({ lat: lat, lon: lon, mm: userCell.mm, snowMm: userCell.snow_mm });
+    }
+  }
+
+  // If still no cells, return empty (will be handled by the block's no-cell case).
+  if (cells.length === 0) {
+    return { cells: [], motion, userTempC: userCur ? userCur.temp_c : null };
+  }
+
+  // Sort cells by distance from user (closest first) for better interception.
+  cells.sort((a, b) => {
+    const dA = Math.hypot(a.lat - lat, a.lon - lon);
+    const dB = Math.hypot(b.lat - lat, b.lon - lon);
+    return dA - dB;
+  });
+
+  return { cells, motion, userTempC: userCur ? userCur.temp_c : null };
 }
 
 // Run the pure interception math over every detected cell and return the cell
@@ -2301,11 +2322,25 @@ async function checkAllUsers() {
                 if (quietDedup > Math.max(cooldownMs, 45 * 60 * 1000)) {
                   const isSnow = hit.snowMm || (traj.userTempC != null && traj.userTempC < 2 && hit.mm > 0);
                   const fromName = windDirName(lang, hit.fromDeg);
+
+                  // Fetch radar tile for this location
+                  let radarInfo = '';
+                  try {
+                    const radar = await fetchRainViewer(loc.latitude, loc.longitude);
+                    if (radar.is_raining) {
+                      const intensityNames = ['', t(lang, 'radar_weak'), t(lang, 'radar_moderate'), t(lang, 'radar_strong'), t(lang, 'radar_very_strong'), t(lang, 'radar_extreme')];
+                      radarInfo = `📡 ${t(lang, 'radar_label')}: ${intensityNames[radar.intensity] || t(lang, 'yes')} (${radar.ageMinutes || '?'}${t(lang, 'unit_min_ago')})`;
+                    }
+                  } catch (e) {
+                    console.warn('[EXP] radar fetch failed:', e.message);
+                  }
+
                   const expMsg =
                     `<b>${t(lang, isSnow ? 'exp_alert_title_snow' : 'exp_alert_title')}</b>\n\n${locLabel}\n` +
                     `${t(lang, 'exp_alert_body', { km: hit.distanceKm, eta: hit.etaMinutes })}\n\n` +
                     `${t(lang, 'exp_alert_direction', { dir: fromName, bearing: hit.distanceKm })}\n\n` +
-                    `⏳ ~${hit.etaMinutes} ${t(lang, 'unit_min')} ${t(lang, 'exp_alert_calc')}`;
+                    `⏳ ~${hit.etaMinutes} ${t(lang, 'unit_min')} ${t(lang, 'exp_alert_calc')}` +
+                    (radarInfo ? `\n${radarInfo}` : '');
                   const expSend = await sendWithFallback(user.chat_id, expMsg, {});
                   if (expSend.ok) {
                     await updateUserLocationState(user.chat_id, locId, { exp_trajectory_last_ms: Date.now() });

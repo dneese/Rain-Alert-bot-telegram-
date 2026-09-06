@@ -1,0 +1,36 @@
+name: Deploy rain worker
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'rain/**'
+      - 'src/**'
+      - 'scripts/**'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build bundle
+        run: npx esbuild src/rain-only.js --bundle --platform=node --format=esm --outfile=dist/rain-bot-worker.js
+
+      - name: Deploy to Cloudflare
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: bash scripts/deploy-rain-worker.sh
