@@ -1,10 +1,13 @@
 let SUPABASE_URL = 'https://ljavyrmgcepwximavjyz.supabase.co';
-let SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || '';
+// The worker talks to Supabase with the SERVICE ROLE key (secret, never public).
+// Falls back to the old env name for pre-rotation bindings.
+let SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE || process.env.SUPABASE_ANON_KEY || '';
 
 export function configureDb(env) {
   env = env || {};
   if (env.SUPABASE_URL) SUPABASE_URL = env.SUPABASE_URL;
-  if (env.SUPABASE_ANON_KEY) SUPABASE_KEY = env.SUPABASE_ANON_KEY;
+  if (env.SUPABASE_SERVICE_ROLE) SUPABASE_KEY = env.SUPABASE_SERVICE_ROLE;
+  else if (env.SUPABASE_ANON_KEY) SUPABASE_KEY = env.SUPABASE_ANON_KEY;
 }
 
 function headers() {

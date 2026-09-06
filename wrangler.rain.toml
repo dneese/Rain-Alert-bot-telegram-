@@ -7,10 +7,10 @@ crons = ["*/15 * * * *"]
 
 [vars]
   SUPABASE_URL = "https://ljavyrmgcepwximavjyz.supabase.co"
-  SUPABASE_ANON_KEY = "sb_publishable_w8mle2GHp_xOTw9hdrX_6A_-2uycK5E"
   WEATHERAPI_KEY = ""
   OWM_KEY = ""
   RAINBOW_KEY = ""
 
-# Secrets (set via: wrangler secret put TELEGRAM_BOT_TOKEN)
+# Secrets (set via: wrangler secret put TELEGRAM_BOT_TOKEN, wrangler secret put SUPABASE_SERVICE_ROLE)
 # TELEGRAM_BOT_TOKEN — rain bot token
+# SUPABASE_SERVICE_ROLE — Supabase service role key (never commit it)

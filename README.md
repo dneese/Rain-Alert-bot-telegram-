@@ -70,8 +70,9 @@ bash scripts/deploy-rain-worker.sh
 Скрипт выполняет три шага через API:
 
 1. `PUT /accounts/{id}/workers/scripts/rain-alert-bot` — загрузка модуля
-   (`main_module` + биндинги: `TELEGRAM_BOT_TOKEN` (secret), `SUPABASE_URL`,
-   `SUPABASE_ANON_KEY`, пустые `WEATHERAPI_KEY`/`OWM_KEY`/`RAINBOW_KEY`).
+(`main_module` + биндинги: `TELEGRAM_BOT_TOKEN` (secret),
+    `SUPABASE_SERVICE_ROLE` (secret), `SUPABASE_URL`,
+    пустые `WEATHERAPI_KEY`/`OWM_KEY`/`RAINBOW_KEY`).
 2. `PUT .../schedules` c телом `[{"cron":"*/15 * * * *"}]` — крон.
 3. `POST .../subdomain` с телом `{"enabled":true}` — включение `*.workers.dev`.
 
@@ -81,7 +82,8 @@ bash scripts/deploy-rain-worker.sh
 > нужной форме.
 
 Переменные воркера тоже можно задать вручную: `CF_WORKER_NAME`,
-`SUPABASE_URL`, `SUPABASE_ANON_KEY`.
+`SUPABASE_URL`. Секретный `SUPABASE_SERVICE_ROLE` задаётся env-переменной
+при запуске скрипта (не коммитится).
 
 ### 3. Настройка webhook Telegram
 

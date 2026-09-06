@@ -15,10 +15,15 @@ CF_ACCOUNT_ID="${CF_ACCOUNT_ID:-}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 WORKER_NAME="${CF_WORKER_NAME:-rain-alert-bot}"
 SUPABASE_URL="${SUPABASE_URL:-https://ljavyrmgcepwximavjyz.supabase.co}"
-SUPABASE_ANON_KEY="${SUPABASE_ANON_KEY:-sb_publishable_w8mle2GHp_xOTw9hdrX_6A_-2uycK5E}"
+# NOTE: never hardcode SUPABASE_SERVICE_ROLE here (it's a secret). Set it as an env var.
+SUPABASE_SERVICE_ROLE="${SUPABASE_SERVICE_ROLE:-}"
 
 if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ACCOUNT_ID" ] || [ -z "$TELEGRAM_BOT_TOKEN" ]; then
   echo "ERROR: set CF_API_TOKEN, CF_ACCOUNT_ID, TELEGRAM_BOT_TOKEN" >&2
+  exit 1
+fi
+if [ -z "${SUPABASE_SERVICE_ROLE}" ]; then
+  echo "ERROR: set SUPABASE_SERVICE_ROLE (Supabase service role key)" >&2
   exit 1
 fi
 
@@ -34,7 +39,7 @@ METADATA=$(cat <<JSON
   "bindings": [
     { "type": "secret_text", "name": "TELEGRAM_BOT_TOKEN", "text": $TOKEN_ESCAPED },
     { "type": "plain_text", "name": "SUPABASE_URL", "text": "$SUPABASE_URL" },
-    { "type": "plain_text", "name": "SUPABASE_ANON_KEY", "text": "$SUPABASE_ANON_KEY" },
+    { "type": "secret_text", "name": "SUPABASE_SERVICE_ROLE", "text": "$SUPABASE_SERVICE_ROLE" },
     { "type": "plain_text", "name": "WEATHERAPI_KEY", "text": "${WEATHERAPI_KEY:-}" },
     { "type": "plain_text", "name": "OWM_KEY", "text": "${OWM_KEY:-}" },
     { "type": "plain_text", "name": "RAINBOW_KEY", "text": "${RAINBOW_KEY:-}" }
