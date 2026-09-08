@@ -26,6 +26,15 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Check secrets presence
+        run: |
+          echo "CF_API_TOKEN presence: ${{ secrets.CF_API_TOKEN != '' }}"
+          echo "CF_ACCOUNT_ID presence: ${{ secrets.CF_ACCOUNT_ID != '' }}"
+          echo "WN3_BOT_TOKEN presence: ${{ secrets.WN3_BOT_TOKEN != '' }}"
+          echo "GOOGLE_WEATHER_API_KEY presence: ${{ secrets.GOOGLE_WEATHER_API_KEY != '' }}"
+          echo "WN3_D1_DB_ID presence: ${{ secrets.WN3_D1_DB_ID != '' }}"
+          echo "MY_CHAT_ID presence: ${{ secrets.MY_CHAT_ID != '' }}"
+
       - name: Deploy to Cloudflare
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
