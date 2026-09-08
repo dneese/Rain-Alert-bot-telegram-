@@ -1,0 +1,37 @@
+name: Deploy WN3-mini worker
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'wn3/**'
+      - 'scripts/deploy-wn3-mini.sh'
+      - 'package.json'
+      - 'package-lock.json'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Deploy to Cloudflare
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          WN3_BOT_TOKEN: ${{ secrets.WN3_BOT_TOKEN }}
+          GOOGLE_WEATHER_API_KEY: ${{ secrets.GOOGLE_WEATHER_API_KEY }}
+          WN3_D1_DB_ID: ${{ secrets.WN3_D1_DB_ID }}
+          MY_CHAT_ID: ${{ secrets.MY_CHAT_ID }}
+        run: bash scripts/deploy-wn3-mini.sh
