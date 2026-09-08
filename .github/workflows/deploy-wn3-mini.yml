@@ -8,6 +8,7 @@ on:
       - 'scripts/deploy-wn3-mini.sh'
       - 'package.json'
       - 'package-lock.json'
+      - '.github/workflows/deploy-wn3-mini.yml'
   workflow_dispatch:
 
 jobs:
